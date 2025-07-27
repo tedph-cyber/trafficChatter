@@ -1,94 +1,60 @@
 from flask import Flask, request, jsonify
+from flask_cors import CORS
 import googlemaps
 from dotenv import load_dotenv
 import os
 import traceback
 from bs4 import BeautifulSoup
+import json
+import g4f
+import uuid
 
 app = Flask(__name__)
+app.secret_key = os.urandom(24)  # needed for session if used
 
+CORS(app, origins=["http://localhost:3000"])
 # Load environment variables
 load_dotenv()
 GMAPS_API_KEY = os.getenv("GMAPS_API_KEY")
 gmaps = googlemaps.Client(key=GMAPS_API_KEY)
+gpt_client = g4f.Client(
+    provider=()
+)
+
+# In-memory session store
+user_sessions = {}
+
+# System prompt
+BASE_SYSTEM_PROMPT = """You are a helpful assistant chatbot trained by OpenAI.
+You answer questions, help users with travel/directions/traffic, or have friendly small talk.
+You respond in a human-like, warm tone and you're always excited to help.
+If a user requests routing, return JSON like:
+{
+  "origin": "...",
+  "destination": "...",
+  "mode": "driving"
+}
+Otherwise, just respond naturally in English.
+"""
 
 
 def clean_html_instruction(html):
     return BeautifulSoup(html, "html.parser").get_text(separator=" ", strip=True)
 
 
-def get_location_details(lat, lng):
-    # Reverse geocode to get state and country
-    try:
-        result = gmaps.reverese_geocode((lat, lng))
-        if not result:
-            raise ValueError("Could not deduce geocode location")
-
-        state = None
-        country = None
-        for component in result[0]['address_components']:
-            if 'administrative_area_level_1' in component['types']:
-                state = component['long_name']
-            if 'country' in component['types']:
-                country = component['long_name']
-        return state, country
-    except Exception as e:
-        raise ValueError(f"Reverse geocoding failed: {str(e)}")
-
-
-def validate_destination(destination, state=None, country=None):
-    # Ensure destination is in the same state or country.
-    try:
-        geocode_result = gmaps.geocode(destination)
-        if not geocode_result:
-            raise ValueError(f"Invalid destination: '{
-                             destination}' not found.")
-
-        # Check if any result matches the state or country
-        for result in geocode_result:
-            address_components = result['address_components']
-            dest_state = None
-            dest_country = None
-            for component in address_components:
-                if 'administrative_area_level_1' in component['types']:
-                    dest_state = component['long_name']
-                if 'country' in component['types']:
-                    dest_country = component['long_name']
-
-            # Prioritize state if provided, else country
-            if state and dest_state == state:
-                return result['formatted_address']
-            if country and dest_country == country:
-                return result['formatted_address']
-
-        # If no match found, raise error
-        raise ValueError(f"No destination found in {state or country}")
-    except Exception as e:
-        raise ValueError(f"Destination validation failed: {str(e)}")
-
-
 def fetch_route_data(origin, destination, mode='driving', departure_time='now'):
-    print(f"[DEBUG] Fetching route from '{origin}' to '{
-          destination}' with mode '{mode}'")
-
-    # Geocode check
     origin_geocode = gmaps.geocode(origin)
     destination_geocode = gmaps.geocode(destination)
-
     if not origin_geocode:
         raise ValueError(f"Invalid origin: '{origin}' not found.")
     if not destination_geocode:
         raise ValueError(f"Invalid destination: '{destination}' not found.")
 
-    # Proceed to get directions
     directions = gmaps.directions(
         origin, destination, mode=mode, departure_time=departure_time, alternatives=True)
-
     distance_matrix = gmaps.distance_matrix(
-        origins=[origin],
-        destinations=[destination],
-        mode=mode,
-        departure_time=departure_time
+        origins=[origin], destinations=[
+            destination], mode=mode, departure_time=departure_time
     )
 
     result = {
@@ -127,42 +93,98 @@ def fetch_route_data(origin, destination, mode='driving', departure_time='now'):
 
 @app.route('/')
 def hello():
-    return "Welcome to TrafficChatter"
+    return "Welcome to TrafficChatter!"
 
 
 @app.route('/chat', methods=['POST'])
 def handle_chat():
+    global user_sessions
     try:
         data = request.get_json()
-        print("Raw request data:", data)
+        user_input = data.get('user_input')
+        session_id = data.get('session_id') or str(
+            uuid.uuid4())  # frontend should send this
+        lat = data.get('lat')
+        lng = data.get('lng')
 
-        user_input = data.get('user_input') if data else None
         if not user_input:
             return jsonify({"error": "No user_input provided"}), 400
 
-        lines = [line.strip()
-                 for line in user_input.splitlines() if line.strip()]
-        keys = ['origin', 'destination', 'mode']
-        parsed_data = {keys[i]: lines[i]
-                       for i in range(min(len(lines), len(keys)))}
+        # 🔒 Per-session conversation history
+        if session_id not in user_sessions:
+            user_sessions[session_id] = [
+                {"role": "system", "content": BASE_SYSTEM_PROMPT}]
 
-        print("Parsed data:", parsed_data)
+        user_sessions[session_id].append(
+            {"role": "user", "content": user_input})
 
-        origin = parsed_data.get('origin')
-        destination = parsed_data.get('destination')
-        mode = parsed_data.get('mode', 'driving')
+        # Reverse geocode user location if provided
+        user_location = None
+        user_state = None
+        user_country = None
+        if lat is not None and lng is not None:
+            try:
+                geocode_result = gmaps.reverse_geocode((lat, lng))
+                if geocode_result:
+                    user_location = geocode_result[0]['formatted_address']
+                    for comp in geocode_result[0]['address_components']:
+                        if 'administrative_area_level_1' in comp['types']:
+                            user_state = comp['long_name']
+                        if 'country' in comp['types']:
+                            user_country = comp['long_name']
+            except Exception as geo_err:
+                print("[WARN] Reverse geocode failed:", geo_err)
 
-        if not origin or not destination:
-            return jsonify({"error": "Missing origin or destination"}), 400
+        # GPT Response (streamed chunks aggregated)
+        stream = gpt_client.chat.completions.create(
+            model="gpt-4o",
+            messages=user_sessions[session_id],
+            temperature=0.8,
+            stream=True
+        )
 
-        print(f"[DEBUG] Inputs — origin: {
-              origin}, destination: {destination}, mode: {mode}")
-        route_data = fetch_route_data(origin, destination, mode)
-        return jsonify(route_data)
+        gpt_output = ""
+        for chunk in stream:
+            delta = chunk.choices[0].delta.content or ""
+            gpt_output += delta
+
+        user_sessions[session_id].append(
+            {"role": "assistant", "content": gpt_output})
+
+        # Try to extract JSON from response
+        extracted_data = {}
+        try:
+            json_start = gpt_output.find('{')
+            json_end = gpt_output.rfind('}') + 1
+            if json_start != -1 and json_end != -1:
+                json_snippet = gpt_output[json_start:json_end]
+                extracted_data = json.loads(json_snippet)
+        except Exception:
+            print("[WARN] No valid JSON in this GPT response.")
+
+        # Fallback: use user location if origin missing
+        origin = extracted_data.get('origin') or user_location
+        destination = extracted_data.get('destination')
+        mode = extracted_data.get('mode', 'driving')
+
+        route_info = None
+        if origin and destination:
+            print(f"[ROUTE] From: {origin} To: {destination} Mode: {mode}")
+            route_info = fetch_route_data(origin, destination, mode)
+
+        return jsonify({
+            "session_id": session_id,
+            "response": gpt_output,
+            "route": route_info,
+            "raw_data": extracted_data,
+            "used_origin": origin,
+            "user_location": user_location,
+            "state": user_state,
+            "country": user_country
+        })
 
     except Exception as e:
-        print("Error occurred:", str(e))
-        traceback.print_exc()  # ← This prints the full stack trace
+        traceback.print_exc()
         return jsonify({"error": str(e)}), 500
 
 
