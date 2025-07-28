@@ -14,7 +14,7 @@ import uuid
 app = Flask(__name__)
 app.secret_key = os.urandom(24)  # needed for session if used
 
-CORS(app, origins=["http://localhost:3000", "traffichat.vercel.app"])
+CORS(app, origins=["http://localhost:3000", "https://traffichat.vercel.app"])
 # Load environment variables
 load_dotenv()
 GMAPS_API_KEY = os.getenv("GMAPS_API_KEY")
