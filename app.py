@@ -7,7 +7,9 @@ import traceback
 from bs4 import BeautifulSoup
 import json
 import g4f
+from g4f.Provider import bing,You 
 import uuid
+
 
 app = Flask(__name__)
 app.secret_key = os.urandom(24)  # needed for session if used
@@ -18,7 +20,8 @@ load_dotenv()
 GMAPS_API_KEY = os.getenv("GMAPS_API_KEY")
 gmaps = googlemaps.Client(key=GMAPS_API_KEY)
 gpt_client = g4f.Client(
-    provider=()
+    Provider=[bing,You],
+    headless=True
 )
 
 # In-memory session store
