@@ -7,20 +7,20 @@ import traceback
 from bs4 import BeautifulSoup
 import json
 import g4f
-from g4f.Provider import bing,You 
+from g4f.Provider import bing, You
 import uuid
 
 
 app = Flask(__name__)
 app.secret_key = os.urandom(24)  # needed for session if used
 
-CORS(app, origins=["http://localhost:3000"])
+CORS(app, origins=["http://localhost:3000", "traffichat.vercel.app"])
 # Load environment variables
 load_dotenv()
 GMAPS_API_KEY = os.getenv("GMAPS_API_KEY")
 gmaps = googlemaps.Client(key=GMAPS_API_KEY)
 gpt_client = g4f.Client(
-    Provider=[bing,You],
+    Provider=[bing, You],
     headless=True
 )
 
