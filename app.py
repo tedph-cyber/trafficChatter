@@ -1,104 +1,181 @@
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-from flask_cors import CORS
 import googlemaps
 from dotenv import load_dotenv
 import os
 import traceback
 from bs4 import BeautifulSoup
 import json
-import g4f
-from g4f.Provider import bing, You
+from openai import OpenAI
 import uuid
 
-
 app = Flask(__name__)
-app.secret_key = os.urandom(24)  # needed for session if used
+app.secret_key = os.urandom(24)
 
 CORS(app, origins=["http://localhost:3000", "https://traffichat.vercel.app"])
+
 # Load environment variables
 load_dotenv()
 GMAPS_API_KEY = os.getenv("GMAPS_API_KEY")
+OR_API_KEY = os.getenv("OR_API_KEY")
+
+# Initialize clients
 gmaps = googlemaps.Client(key=GMAPS_API_KEY)
-gpt_client = g4f.Client(
-    Provider=[bing, You],
-    headless=True
+openrouter_client = OpenAI(
+    base_url="https://openrouter.ai/api/v1",
+    api_key=OR_API_KEY
 )
 
 # In-memory session store
 user_sessions = {}
 
 # System prompt
-BASE_SYSTEM_PROMPT = """You are a helpful assistant chatbot trained by OpenAI.
-You answer questions, help users with travel/directions/traffic, or have friendly small talk.
-You respond in a human-like, warm tone and you're always excited to help.
-If a user requests routing, return JSON like:
+BASE_SYSTEM_PROMPT = """You are TrafficChatter, a helpful assistant chatbot specializing in travel, directions, and traffic information.
+You respond in a human-like, warm tone and are always excited to help.
+
+When a user requests routing information, first extract the origin, destination, and mode (driving, walking, bicycling, or transit; default to 'driving' if unspecified) from the input and return a JSON object like:
 {
   "origin": "...",
   "destination": "...",
   "mode": "driving"
 }
-Otherwise, just respond naturally in English.
+If route data is provided (e.g., from Google Maps API), incorporate it into your response by summarizing the key details (distance, duration, traffic severity, and main route steps) in a natural, friendly manner. Include the raw route data in your response as a JSON string for reference, formatted as:
+**Route Details:**
+```json
+{route_data}
+```
+
+For non-route requests, provide travel tips, traffic advice, or friendly conversation in English. Be concise but helpful.
 """
 
-
 def clean_html_instruction(html):
+    """Clean HTML instructions from Google Maps API response"""
     return BeautifulSoup(html, "html.parser").get_text(separator=" ", strip=True)
 
-
 def fetch_route_data(origin, destination, mode='driving', departure_time='now'):
-    origin_geocode = gmaps.geocode(origin)
-    destination_geocode = gmaps.geocode(destination)
-    if not origin_geocode:
-        raise ValueError(f"Invalid origin: '{origin}' not found.")
-    if not destination_geocode:
-        raise ValueError(f"Invalid destination: '{destination}' not found.")
+    """Fetch route data from Google Maps API"""
+    try:
+        # Validate inputs Macmillan
+        origin_geocode = gmaps.geocode(origin)
+        destination_geocode = gmaps.geocode(destination)
+        
+        if not origin_geocode:
+            raise ValueError(f"Invalid origin: '{origin}' not found.")
+        if not destination_geocode:
+            raise ValueError(f"Invalid destination: '{destination}' not found.")
 
-    directions = gmaps.directions(
-        origin, destination, mode=mode, departure_time=departure_time, alternatives=True)
-    distance_matrix = gmaps.distance_matrix(
-        origins=[origin], destinations=[
-            destination], mode=mode, departure_time=departure_time
-    )
+        # Get directions and distance matrix
+        directions = gmaps.directions(
+            origin, destination, mode=mode, departure_time=departure_time, alternatives=True
+        )
+        distance_matrix = gmaps.distance_matrix(
+            origins=[origin], 
+            destinations=[destination], 
+            mode=mode, 
+            departure_time=departure_time
+        )
 
-    result = {
-        "routes": [],
-        "distance": None,
-        "duration": None,
-        "duration_in_traffic": None,
-        "traffic_severity": None
-    }
-
-    for route in directions:
-        route_info = {
-            "summary": route['summary'],
-            "distance": route['legs'][0]['distance']['text'],
-            "duration": route['legs'][0]['duration']['text'],
-            "steps": [clean_html_instruction(step['html_instructions']) for step in route['legs'][0]['steps']]
+        result = {
+            "routes": [],
+            "distance": None,
+            "duration": None,
+            "duration_in_traffic": None,
+            "traffic_severity": None
         }
-        result["routes"].append(route_info)
 
-    element = distance_matrix['rows'][0]['elements'][0]
-    result["distance"] = element['distance']['text']
-    result["duration"] = element['duration']['text']
-    if 'duration_in_traffic' in element:
-        result["duration_in_traffic"] = element['duration_in_traffic']['text']
-        normal_duration = element['duration']['value']
-        traffic_duration = element['duration_in_traffic']['value']
-        severity = "Low"
-        if traffic_duration > normal_duration * 1.5:
-            severity = "High"
-        elif traffic_duration > normal_duration * 1.2:
-            severity = "Medium"
-        result["traffic_severity"] = severity
+        # Process route alternatives
+        for route in directions:
+            route_info = {
+                "summary": route['summary'],
+                "distance": route['legs'][0]['distance']['text'],
+                "duration": route['legs'][0]['duration']['text'],
+                "steps": [clean_html_instruction(step['html_instructions']) for step in route['legs'][0]['steps']]
+            }
+            result["routes"].append(route_info)
 
-    return result
+        # Process main route data
+        element = distance_matrix['rows'][0]['elements'][0]
+        result["distance"] = element['distance']['text']
+        result["duration"] = element['duration']['text']
+        
+        # Calculate traffic severity if available
+        if 'duration_in_traffic' in element:
+            result["duration_in_traffic"] = element['duration_in_traffic']['text']
+            normal_duration = element['duration']['value']
+            traffic_duration = element['duration_in_traffic']['value']
+            
+            severity = "Low"
+            if traffic_duration > normal_duration * 1.5:
+                severity = "High"
+            elif traffic_duration > normal_duration * 1.2:
+                severity = "Medium"
+            result["traffic_severity"] = severity
 
+        return result
+    
+    except Exception as e:
+        print(f"Route fetch error: {str(e)}")
+        raise
+
+def get_openrouter_response(messages, temperature=0.8, model="openai/gpt-4o-mini"):
+    """Get response from OpenRouter API with conversation history"""
+    try:
+        chat_completion = openrouter_client.chat.completions.create(
+            messages=messages,
+            model=model,
+            temperature=temperature,
+            max_tokens=1000
+        )
+        return chat_completion.choices[0].message.content
+    
+    except Exception as e:
+        print(f"OpenRouter API error: {str(e)}")
+        return "I'm having trouble connecting to my AI service right now. Please try again in a moment."
+
+def extract_route_json(text):
+    """Extract JSON route data from AI response"""
+    try:
+        json_start = text.find('{')
+        json_end = text.rfind('}') + 1
+        
+        if json_start != -1 and json_end != -1:
+            json_snippet = text[json_start:json_end]
+            extracted_data = json.loads(json_snippet)
+            if any(key in extracted_data for key in ['origin', 'destination']):
+                return extracted_data
+        return {}
+    
+    except Exception as e:
+        print(f"JSON extraction error: {str(e)}")
+        return {}
+
+def get_user_location_info(lat, lng):
+    """Get user location information from coordinates"""
+    try:
+        geocode_result = gmaps.reverse_geocode((lat, lng))
+        if not geocode_result:
+            return None, None, None, ""
+        
+        user_location = geocode_result[0]['formatted_address']
+        user_state = None
+        user_country = None
+        
+        for comp in geocode_result[0]['address_components']:
+            if 'administrative_area_level_1' in comp['types']:
+                user_state = comp['long_name']
+            if 'country' in comp['types']:
+                user_country = comp['long_name']
+        
+        location_context = f"\n\nUser's current location: {user_location}"
+        return user_location, user_state, user_country, location_context
+    
+    except Exception as geo_err:
+        print(f"[WARN] Reverse geocode failed: {geo_err}")
+        return None, None, None, ""
 
 @app.route('/')
 def hello():
     return "Welcome to TrafficChatter!"
-
 
 @app.route('/chat', methods=['POST'])
 def handle_chat():
@@ -106,91 +183,167 @@ def handle_chat():
     try:
         data = request.get_json()
         user_input = data.get('user_input')
-        session_id = data.get('session_id') or str(
-            uuid.uuid4())  # frontend should send this
+        session_id = data.get('session_id') or str(uuid.uuid4())
         lat = data.get('lat')
         lng = data.get('lng')
+        model = data.get('model', 'openai/gpt-4o-mini')
 
         if not user_input:
             return jsonify({"error": "No user_input provided"}), 400
 
-        # 🔒 Per-session conversation history
+        # Initialize session conversation history
         if session_id not in user_sessions:
             user_sessions[session_id] = [
-                {"role": "system", "content": BASE_SYSTEM_PROMPT}]
+                {"role": "system", "content": BASE_SYSTEM_PROMPT}
+            ]
 
-        user_sessions[session_id].append(
-            {"role": "user", "content": user_input})
+        # Get user location information
+        user_location, user_state, user_country, location_context = get_user_location_info(lat, lng)
 
-        # Reverse geocode user location if provided
-        user_location = None
-        user_state = None
-        user_country = None
-        if lat is not None and lng is not None:
-            try:
-                geocode_result = gmaps.reverse_geocode((lat, lng))
-                if geocode_result:
-                    user_location = geocode_result[0]['formatted_address']
-                    for comp in geocode_result[0]['address_components']:
-                        if 'administrative_area_level_1' in comp['types']:
-                            user_state = comp['long_name']
-                        if 'country' in comp['types']:
-                            user_country = comp['long_name']
-            except Exception as geo_err:
-                print("[WARN] Reverse geocode failed:", geo_err)
+        # Add user message with location context
+        user_message = user_input + location_context
+        user_sessions[session_id].append({"role": "user", "content": user_message})
 
-        # GPT Response (streamed chunks aggregated)
-        stream = gpt_client.chat.completions.create(
-            model="gpt-4o",
-            messages=user_sessions[session_id],
-            temperature=0.8,
-            stream=True
-        )
+        # Get initial AI response to parse route data
+        ai_response = get_openrouter_response(user_sessions[session_id], model=model)
+        user_sessions[session_id].append({"role": "assistant", "content": ai_response})
 
-        gpt_output = ""
-        for chunk in stream:
-            delta = chunk.choices[0].delta.content or ""
-            gpt_output += delta
-
-        user_sessions[session_id].append(
-            {"role": "assistant", "content": gpt_output})
-
-        # Try to extract JSON from response
-        extracted_data = {}
-        try:
-            json_start = gpt_output.find('{')
-            json_end = gpt_output.rfind('}') + 1
-            if json_start != -1 and json_end != -1:
-                json_snippet = gpt_output[json_start:json_end]
-                extracted_data = json.loads(json_snippet)
-        except Exception:
-            print("[WARN] No valid JSON in this GPT response.")
-
-        # Fallback: use user location if origin missing
+        # Extract route information
+        extracted_data = extract_route_json(ai_response)
         origin = extracted_data.get('origin') or user_location
         destination = extracted_data.get('destination')
         mode = extracted_data.get('mode', 'driving')
 
-        route_info = None
-        if origin and destination:
-            print(f"[ROUTE] From: {origin} To: {destination} Mode: {mode}")
-            route_info = fetch_route_data(origin, destination, mode)
-
-        return jsonify({
+        # Prepare response data
+        response_data = {
             "session_id": session_id,
-            "response": gpt_output,
-            "route": route_info,
+            "response": ai_response,
+            "route": None,
             "raw_data": extracted_data,
             "used_origin": origin,
             "user_location": user_location,
             "state": user_state,
-            "country": user_country
-        })
+            "country": user_country,
+            "model_used": model
+        }
+
+        # Fetch route information if we have origin and destination
+        if origin and destination:
+            try:
+                print(f"[ROUTE] From: {origin} To: {destination} Mode: {mode}")
+                route_info = fetch_route_data(origin, destination, mode)
+                
+                # Add route data to conversation history for AI to summarize
+                route_json_str = json.dumps(route_info, indent=2)
+                user_sessions[session_id].append({
+                    "role": "system",
+                    "content": f"Route data: {route_json_str}"
+                })
+
+                # Get AI response with route data embedded
+                ai_response_with_route = get_openrouter_response(
+                    messages=user_sessions[session_id],
+                    model=model
+                )
+                user_sessions[session_id].append({"role": "assistant", "content": ai_response_with_route})
+
+                response_data["response"] = ai_response_with_route
+                response_data["route"] = route_info
+
+                # Add route summary to conversation history
+                route_summary = f"Route found: {route_info.get('distance', 'N/A')} distance, {route_info.get('duration', 'N/A')} duration"
+                if route_info.get('traffic_severity'):
+                    route_summary += f", {route_info.get('traffic_severity')} traffic"
+                
+                user_sessions[session_id].append({
+                    "role": "system",
+                    "content": f"Route information: {route_summary}"
+                })
+                
+            except Exception as route_err:
+                print(f"[ROUTE ERROR] {str(route_err)}")
+                response_data["route"] = {"error": str(route_err)}
+                response_data["response"] = f"{ai_response}\n\n**Route Error:** {str(route_err)}"
+
+        # Limit conversation history to prevent token overflow
+        if len(user_sessions[session_id]) > 20:
+            user_sessions[session_id] = [user_sessions[session_id][0]] + user_sessions[session_id][-18:]
+
+        return jsonify(response_data)
 
     except Exception as e:
         traceback.print_exc()
         return jsonify({"error": str(e)}), 500
 
+@app.route('/clear_session', methods=['POST'])
+def clear_session():
+    """Clear conversation history for a session"""
+    try:
+        data = request.get_json()
+        session_id = data.get('session_id')
+        
+        if session_id and session_id in user_sessions:
+            del user_sessions[session_id]
+            return jsonify({"message": "Session cleared successfully"})
+        
+        return jsonify({"message": "Session not found or already clear"})
+    
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/models', methods=['GET'])
+def get_available_models():
+    """Get list of available OpenRouter models"""
+    popular_models = [
+        "openai/gpt-4o",
+        "openai/gpt-4o-mini",
+        "anthropic/claude-3.5-sonnet",
+        "anthropic/claude-3-haiku",
+        "google/gemini-pro-1.5",
+        "meta-llama/llama-3.1-70b-instruct",
+        "mistralai/mixtral-8x7b-instruct"
+    ]
+    
+    return jsonify({
+        "popular_models": popular_models,
+        "default": "openai/gpt-4o-mini"
+    })
+
+@app.route('/health', methods=['GET'])
+def health_check():
+    """Health check endpoint"""
+    try:
+        test_response = openrouter_client.chat.completions.create(
+            messages=[{"role": "user", "content": "Hi"}],
+            model="openai/gpt-4o-mini",
+            max_tokens=5
+        )
+        
+        return jsonify({
+            "status": "healthy",
+            "openrouter_connected": True,
+            "gmaps_key_present": bool(GMAPS_API_KEY),
+            "active_sessions": len(user_sessions),
+            "test_response": test_response.choices[0].message.content if test_response.choices else "No response"
+        })
+    
+    except Exception as e:
+        return jsonify({
+            "status": "unhealthy",
+            "error": str(e),
+            "openrouter_connected": False,
+            "gmaps_key_present": bool(GMAPS_API_KEY),
+            "active_sessions": len(user_sessions)
+        }), 500
+
+@app.route('/usage', methods=['GET'])
+def get_usage_info():
+    """Get current usage statistics"""
+    return jsonify({
+        "active_sessions": len(user_sessions),
+        "total_conversations": sum(len(session) for session in user_sessions.values()),
+        "sessions": {sid: len(messages) for sid, messages in user_sessions.items()}
+    })
 
 if __name__ == '__main__':
     app.run(debug=True)
